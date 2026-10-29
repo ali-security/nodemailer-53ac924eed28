@@ -931,6 +931,52 @@ describe('#addressparser', () => {
             assert.ok(elapsed < 5000, `parsing ${count * 2} fragments took ${elapsed}ms`);
         });
 
+        // Falling back to reading an address out of free text searched for
+        // /\s*\b[^@\s]+@[^\s]+\b\s*/, which retries '[^@\s]+' from every offset and rescans the
+        // run to the next '@' each time. A header run carrying no usable '@' made that
+        // quadratic (GHSA-v53p-9fqp-m79j), far more cheaply than a comment-joined address
+        // does: 273KB took
+        // ~43s of blocked event loop. The shapes below are the three ways the '@' can be
+        // unusable, plus a run that has none at all.
+        for (const [label, build] of [
+            ['no at sign at all', count => '[x]'.repeat(count)],
+            ['an at sign with nothing after it', count => '[x]'.repeat(count) + '@'],
+            ['an at sign with nothing before it', count => '@' + '[x]'.repeat(count)],
+            ['an address only past a long run', count => '[x]'.repeat(count) + ' a@b.com']
+        ]) {
+            it(`should scan free text holding ${label} in linear time`, () => {
+                const count = 40000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `scanning a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+
+        // The scan looks for the next '@' once per whitespace delimited run. Restarting that
+        // lookup from every run rescans the rest of the value each time when no '@' is left,
+        // so many short runs would be quadratic again even though the pattern itself is not.
+        it('should scan free text made of many short runs with no at sign in linear time', () => {
+            const count = 1000000;
+            const input = 'x '.repeat(count) + 'y';
+
+            const started = Date.now();
+            const result = addressparser(input);
+            const elapsed = Date.now() - started;
+
+            assert.deepStrictEqual(result, [{ address: '', name: input }]);
+            assert.ok(elapsed < 5000, `scanning a ${input.length} byte value took ${elapsed}ms`);
+        });
+
+        it('should still read an address out of free text', () => {
+            assert.deepStrictEqual(addressparser('junk [x] a@b.com more'), [{ address: 'a@b.com', name: 'junk [x] more' }]);
+            assert.deepStrictEqual(addressparser('   a@b.com   '), [{ address: 'a@b.com', name: '' }]);
+            assert.deepStrictEqual(addressparser('!a@b!'), [{ address: '!a@b!', name: '' }]);
+        });
+
         it('should keep name fragment parsing identical to the previous implementation', () => {
             assert.deepStrictEqual(addressparser('Joe Foo, PhD <joe@example.com>'), [
                 { address: '', name: 'Joe Foo' },

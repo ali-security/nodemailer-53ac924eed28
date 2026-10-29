@@ -1738,6 +1738,23 @@ describe('MimeNode Tests', { timeout: 50 * 1000 }, () => {
             assert.ok(elapsed < 2000, `${count} single-recipient headers took ${elapsed}ms`);
         });
 
+        // A recipient header holding a long run with no usable '@' sent addressparser's
+        // free-text fallback quadratic (GHSA-v53p-9fqp-m79j), so an application handing
+        // untrusted to/cc/bcc values to a message blocked the event loop while building it.
+        it('should build the envelope for a long free-text recipient in linear time', () => {
+            const count = 40000;
+
+            const started = Date.now();
+            const mb = new MimeNode('text/plain');
+            mb.setHeader('To', '[x]'.repeat(count) + ' a@b.com');
+            mb.setHeader('Cc', '[x]'.repeat(count));
+            const envelope = mb.getEnvelope();
+            const elapsed = Date.now() - started;
+
+            assert.deepStrictEqual(envelope.to, ['a@b.com']);
+            assert.ok(elapsed < 5000, `building an envelope from ${count * 6} bytes of recipients took ${elapsed}ms`);
+        });
+
         it('should dedupe recipients across To, Cc and Bcc', () => {
             const mb = new MimeNode('text/plain');
             mb.setHeader('To', 'a@example.com, a@example.com, b@example.com');
