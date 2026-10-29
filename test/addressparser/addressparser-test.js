@@ -321,6 +321,31 @@ describe('#addressparser', () => {
         assert.strictEqual(result[0].address, 'a@b@c @example.com');
     });
 
+    it('should not make an address of a quoted display name that holds no "@" (security)', () => {
+        // A quoted run with no '@' in it is a display name and nothing else. A comment inside
+        // the angle brackets must not turn it into the mailbox, as a name carrying a ',' or a
+        // ';' would become an address that reads as two recipients once a consumer writes it
+        // back into a header
+        for (const [input, name] of [
+            ['"a,b" <(x)>', 'a,b'],
+            ['"a;b" <(x)>', 'a;b'],
+            ['"a<b>c" <(x)>', 'a<b>c'],
+            ['"Display Name" <(no address here)>', 'Display Name']
+        ]) {
+            const result = addressparser(input);
+            assert.strictEqual(result.length, 1, input);
+            assert.strictEqual(result[0].address, '', input);
+            assert.strictEqual(result[0].name, name, input);
+        }
+
+        // a quoted run that does hold an '@' is still read as the mailbox, the same way it is
+        // read when the brackets are empty
+        const quoted = addressparser('"victim@good.com, attacker@evil.com" <(x)>');
+        assert.strictEqual(quoted.length, 1);
+        assert.strictEqual(quoted[0].address, addressparser('"victim@good.com, attacker@evil.com" <>')[0].address);
+        assert.strictEqual(quoted[0].address.indexOf('('), -1);
+    });
+
     it('should handle quoted local-part with angle brackets', () => {
         let input = 'Name <"user@domain.com"@example.com>';
         let result = addressparser(input);
@@ -685,6 +710,92 @@ describe('#addressparser', () => {
             let result = addressparser(input);
             assert.strictEqual(result.length, 1);
             assert.strictEqual(result[0].address, 'user@example.com');
+        });
+    });
+
+    describe('Comments inside an angle-addr', () => {
+        // The tokenizer does not open a comment while '<' is open, so the comment used to
+        // reach the envelope verbatim as 'user@good-corp.com(x)evil.com', a value that is no
+        // mailbox and that a receiver stripping the comment reads as another domain
+        // (GHSA-g73g-hqqh-jr95). It has to read the same as the unbracketed form
+        it('should not carry a comment into the address', () => {
+            assert.deepStrictEqual(addressparser('Legit User <user@good-corp.com(x)evil.com>'), [
+                { address: 'user@good-corp.com', name: 'Legit User evil.com' }
+            ]);
+            assert.deepStrictEqual(addressparser('<user@good-corp.com(x)evil.com>'), addressparser('user@good-corp.com(x)evil.com'));
+        });
+
+        it('should not glue across empty, repeated, nested, escaped or unterminated comments', () => {
+            for (const input of [
+                'A <user@good-corp.com()evil.com>',
+                'A <user@good-corp.com(a)(b)evil.com>',
+                'A <user@good-corp.com((a) b)evil.com>',
+                'A <user@good-corp.com(\\)x)evil.com>',
+                'A <user@good-corp.com(x evil.com>',
+                'A <user@good-corp.com(x)evil.com',
+                'G: A <user@good-corp.com(x)evil.com>;'
+            ]) {
+                const parsed = addressparser(input, { flatten: true });
+                assert.strictEqual(parsed.length, 1, input);
+                assert.strictEqual(parsed[0].address, 'user@good-corp.com', input);
+            }
+            // a quoted local part keeps its quotes inside the brackets
+            assert.strictEqual(addressparser('A <"user"@good-corp.com(x)evil.com>')[0].address, '"user"@good-corp.com');
+        });
+
+        // the comment is dropped when there is a name, the way one outside the brackets is
+        it('should keep the text around a comment but not the comment in the name', () => {
+            assert.deepStrictEqual(addressparser('Name <user@a.com (x) evil.com>'), [{ address: 'user@a.com', name: 'Name evil.com' }]);
+            assert.deepStrictEqual(addressparser('Name <user@a.com> (x)'), [{ address: 'user@a.com', name: 'Name' }]);
+        });
+
+        it('should still resolve an address with a comment beside the @ or at either end', () => {
+            for (const input of [
+                'Name <user(c)@example.com>',
+                'Name <user@(c)example.com>',
+                'Name <(c)user@example.com>',
+                'Name <user@example.com(c)>',
+                'Name <user@example.com (c)>',
+                'Name <(a@evil.com)user@example.com>'
+            ]) {
+                assert.deepStrictEqual(addressparser(input), [{ address: 'user@example.com', name: 'Name' }], input);
+            }
+        });
+
+        // brackets holding only a comment have to take the same path as empty ones
+        it('should read brackets holding only a comment as empty ones', () => {
+            for (const name of [
+                '"a@evil.com, b@good.com"',
+                '"a@evil.com; b@evil.com"',
+                '"a@b@evil.com"',
+                '(a@evil.com, b@evil.com)',
+                'Name'
+            ]) {
+                assert.strictEqual(addressparser(`${name} <(x)>`)[0].address, addressparser(`${name} <>`)[0].address, name);
+            }
+        });
+
+        it('should read a comment as the display name when there is none', () => {
+            assert.deepStrictEqual(addressparser('<user@example.com(John Doe)>'), [{ address: 'user@example.com', name: 'John Doe' }]);
+            assert.deepStrictEqual(addressparser('<(only a comment)>'), [{ address: '', name: 'only a comment' }]);
+        });
+
+        it('should leave parentheses inside a quoted local part or a domain literal alone', () => {
+            assert.strictEqual(addressparser('Name <"a(b)"@example.com>')[0].address, '"a(b)"@example.com');
+            assert.strictEqual(addressparser('Name <"a\\"(b)"@example.com(c)>')[0].address, '"a\\"(b)"@example.com');
+            assert.strictEqual(addressparser('Name <user@[a(b)c]>')[0].address, 'user@[a(b)c]');
+            assert.strictEqual(addressparser('Name <user@[1.2.3.4](x)>')[0].address, 'user@[1.2.3.4]');
+        });
+
+        it('should strip many comments in linear time', () => {
+            const count = 200000;
+            for (const input of ['A <a@b' + '(c)d'.repeat(count) + '>', 'A <a@b' + '('.repeat(count) + '>']) {
+                const started = Date.now();
+                const parsed = addressparser(input);
+                const elapsed = Date.now() - started;
+                assert.strictEqual(parsed[0].address, 'a@b');
+                assert.ok(elapsed < 5000, `stripping took ${elapsed}ms`);
+            }
         });
     });
 
