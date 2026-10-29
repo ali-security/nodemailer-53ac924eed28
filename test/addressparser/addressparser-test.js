@@ -1121,4 +1121,135 @@ describe('#addressparser', () => {
             ]);
         });
     });
+
+    // The tokenizer tracks one open operator, so once '<' or ':' was open it only looked for
+    // the '>' or ';' that closes it and missed the quoted strings, comments and domain
+    // literals in between. A '>' inside a quoted local part ended the angle-addr early and
+    // the domain was read off the wreckage, and a ';' inside a quoted display name or a
+    // comment ended the group and released the rest of that text as recipients
+    describe('Closers inside an angle-addr or a group', () => {
+        it('should not close an angle-addr at a ">" inside a quoted string, a comment or a domain literal', () => {
+            for (const [input, expected] of [
+                ['<"a@evil.com>"@good.com>', [{ address: '"a@evil.com>"@good.com', name: '' }]],
+                ['<"a\\>"@good.com>', [{ address: '"a\\>"@good.com', name: '' }]],
+                ['<a@[>]>', [{ address: 'a@[>]', name: '' }]],
+                ['<a@[;"]>', [{ address: 'a@[;"]', name: '' }]],
+                ['<a@[x,y>]>', [{ address: 'a@[x,y>]', name: '' }]],
+                ['Name <"x>"@evil.com>', [{ address: '"x>"@evil.com', name: 'Name' }]],
+                ['<a@good.com(x>y)>', [{ address: 'a@good.com', name: 'x>y' }]],
+                ['<a@b((x)>)>', [{ address: 'a@b', name: '(x)>' }]],
+                ['<a@b(\\)>)>', [{ address: 'a@b', name: ')>' }]]
+            ]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should not end a group at a ";" inside a quoted string or a comment', () => {
+            for (const [input, expected] of [
+                [
+                    'G: (a; <evil@evil.com>) <v@victim.com>;',
+                    [{ name: 'G', group: [{ address: 'v@victim.com', name: 'a; <evil@evil.com>' }] }]
+                ],
+                [
+                    'G: "a;" "<evil@evil.com>" <v@victim.com>;',
+                    [{ name: 'G', group: [{ address: 'v@victim.com', name: 'a; <evil@evil.com>' }] }]
+                ],
+                ['G: "a;b" <x@y>;', [{ name: 'G', group: [{ address: 'x@y', name: 'a;b' }] }]],
+                ['G: "a\\";" <x@y>;', [{ name: 'G', group: [{ address: 'x@y', name: 'a";' }] }]],
+                ['G: <"a;"@good.com>;', [{ name: 'G', group: [{ address: '"a;"@good.com', name: '' }] }]]
+            ]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        it('should let an escaped backslash end the quoted string it is in', () => {
+            assert.deepStrictEqual(addressparser('<"a\\\\"@b.com>, c@d.com'), [
+                { address: '"a\\\\"@b.com', name: '' },
+                { address: 'c@d.com', name: '' }
+            ]);
+            assert.deepStrictEqual(addressparser('G: "a\\\\" <x@y>; c@d.com'), [
+                { name: 'G', group: [{ address: 'x@y', name: 'a\\' }] },
+                { address: 'c@d.com', name: '' }
+            ]);
+        });
+
+        // the same reading an unclosed quoted string or comment gets outside the brackets
+        it('should read an unclosed quoted string or comment to the end of the value', () => {
+            for (const input of ['<"a@b.com>, c@d.com', '<a@b.com(x>, c@d.com', 'G: "a;, c@d.com', 'G: (a;, c@d.com']) {
+                assert.strictEqual(addressparser(input).length, 1, input);
+            }
+        });
+
+        // This version has no domain literal tracking outside the operators, so a bare
+        // 'a@[IPv6:...]' in a group still reads its ':' as a group opener the way it did before
+        // this fix. That is not what the fix is about, so the group form is not asserted here
+        it('should still end an angle-addr and a group at the closer outside them', () => {
+            for (const [input, expected] of [
+                [
+                    '<a@b.com>, <c@d.com>',
+                    [
+                        { address: 'a@b.com', name: '' },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                ],
+                [
+                    '"x" <a@b.com>, "y" <c@d.com>',
+                    [
+                        { address: 'a@b.com', name: 'x' },
+                        { address: 'c@d.com', name: 'y' }
+                    ]
+                ],
+                [
+                    '<"x"@b.com>, <(y)c@d.com>',
+                    [
+                        { address: '"x"@b.com', name: '' },
+                        { address: 'c@d.com', name: 'y' }
+                    ]
+                ],
+                [
+                    'G: "x" <a@b.com>; c@d.com',
+                    [
+                        { name: 'G', group: [{ address: 'a@b.com', name: 'x' }] },
+                        { address: 'c@d.com', name: '' }
+                    ]
+                ],
+                ['<a@[IPv6:2001:db8::1]>', [{ address: 'a@[IPv6:2001:db8::1]', name: '' }]]
+            ]) {
+                assert.deepStrictEqual(addressparser(input), expected, input);
+            }
+        });
+
+        // An unclosed '[' must not swallow the recipients after it, so a literal is not
+        // tracked in a group and a ';' inside one still ends the group. A literal holding a ';'
+        // is not something any mail system hands out. Inside an angle-addr the ',' never split
+        // the list, so the literal there runs to its ']' or to the end of the value. This
+        // version does not split the contents of the brackets at whitespace, so it is read as
+        // one address, still without a second recipient
+        it('should still end a group at a ";" inside a domain literal', () => {
+            assert.deepStrictEqual(addressparser('G: a@[x;y];'), [
+                { name: 'G', group: [{ address: 'a@[x', name: '' }] },
+                { address: '', name: 'y]' }
+            ]);
+            assert.deepStrictEqual(addressparser('<a@[x, c@d.com>'), [{ address: 'a@[x, c@d.com>', name: '' }]);
+        });
+
+        for (const [label, build] of [
+            ['an unclosed quoted string in an angle-addr', count => '<"' + 'a'.repeat(count)],
+            ['an unclosed quoted string in a group', count => 'G: "' + ';'.repeat(count)],
+            ['nested comments in an angle-addr', count => '<' + '('.repeat(count)],
+            ['nested comments in a group', count => 'G: ' + '('.repeat(count)],
+            ['many quoted strings in a group', count => 'G: ' + '"a;" '.repeat(count / 5) + ';']
+        ]) {
+            it(`should tokenize ${label} in linear time`, () => {
+                const count = 400000;
+                const input = build(count);
+
+                const started = Date.now();
+                addressparser(input);
+                const elapsed = Date.now() - started;
+
+                assert.ok(elapsed < 5000, `tokenizing a ${input.length} byte value took ${elapsed}ms`);
+            });
+        }
+    });
 });
