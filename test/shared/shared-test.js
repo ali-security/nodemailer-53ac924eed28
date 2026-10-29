@@ -7,6 +7,7 @@ const shared = require('../../lib/shared');
 const http = require('http');
 const fs = require('fs');
 const zlib = require('zlib');
+const dns = require('dns');
 
 describe('Shared Funcs Tests', { timeout: 100 * 1000 }, () => {
     describe('Logger tests', () => {
@@ -602,6 +603,186 @@ describe('Shared Funcs Tests', { timeout: 100 * 1000 }, () => {
                     done();
                 }
             );
+        });
+
+        describe('server name of cached entries', () => {
+            // never resolved for real, every DNS answer below comes from a stub
+            const HOST = 'cache.servername.invalid';
+
+            const dnsError = code => {
+                let err = new Error('DNS error ' + code);
+                err.code = code;
+                return err;
+            };
+
+            // answers resolve4/resolve6 with the given addresses, or fails them with the given error
+            const stubResolver = (t, answers) => {
+                [4, 6].forEach(family => {
+                    t.mock.method(dns.Resolver.prototype, 'resolve' + family, (hostname, callback) => {
+                        let answer = answers[family];
+                        if (answer instanceof Error) {
+                            return callback(answer);
+                        }
+                        return callback(null, answer);
+                    });
+                });
+            };
+
+            // dns.lookup answers asynchronously, so does the stub
+            const stubLookup = (t, handler) => {
+                t.mock.method(dns, 'lookup', function () {
+                    let args = arguments;
+                    setImmediate(() => handler.apply(null, args));
+                });
+            };
+
+            const setExpiredCache = address => {
+                shared.dnsCache.set(HOST, {
+                    value: { addresses: [address] },
+                    expires: Date.now() - 1000
+                });
+            };
+
+            beforeEach(() => {
+                // a single external IPv4 and IPv6 interface, so both resolvers are queried
+                Object.keys(shared.networkInterfaces).forEach(key => {
+                    delete shared.networkInterfaces[key];
+                });
+
+                shared.networkInterfaces.en0 = [
+                    {
+                        address: '192.0.2.100',
+                        netmask: '255.255.255.0',
+                        family: 'IPv4',
+                        mac: 'f0:18:98:57:76:44',
+                        internal: false,
+                        cidr: '192.0.2.100/24'
+                    },
+                    {
+                        address: 'fe80::184e:7a8e:2d67:be86',
+                        netmask: 'ffff:ffff:ffff:ffff::',
+                        family: 'IPv6',
+                        mac: 'f0:18:98:57:76:44',
+                        internal: false,
+                        cidr: 'fe80::184e:7a8e:2d67:be86/64',
+                        scopeid: 6
+                    }
+                ];
+            });
+
+            afterEach(() => {
+                shared.dnsCache.delete(HOST);
+            });
+
+            it('should hand back the server name of the caller from a cached entry', (t, done) => {
+                stubResolver(t, { 4: ['192.0.2.1'], 6: [] });
+
+                shared.resolveHostname({ host: HOST, servername: 'first.example.test' }, (err, result) => {
+                    assert.ok(!err);
+                    assert.strictEqual(result.cached, false);
+                    assert.strictEqual(result.servername, 'first.example.test');
+                    // the cache holds addresses only, see resolveHostname
+                    assert.deepStrictEqual(shared.dnsCache.get(HOST).value, { addresses: ['192.0.2.1'] });
+
+                    shared.resolveHostname({ host: HOST, servername: 'second.example.test' }, (err, result) => {
+                        assert.ok(!err);
+                        assert.strictEqual(result.cached, true);
+                        assert.strictEqual(result.servername, 'second.example.test');
+
+                        shared.resolveHostname({ host: HOST }, (err, result) => {
+                            assert.ok(!err);
+                            assert.strictEqual(result.cached, true);
+                            assert.strictEqual(result.servername, HOST);
+                            done();
+                        });
+                    });
+                });
+            });
+
+            it('should hand back the server name of the caller from a cached IPv6 entry', (t, done) => {
+                stubResolver(t, { 4: [], 6: ['2001:db8::1'] });
+
+                shared.resolveHostname({ host: HOST, servername: 'first.example.test' }, (err, result) => {
+                    assert.ok(!err);
+                    assert.strictEqual(result.cached, false);
+                    assert.strictEqual(result.host, '2001:db8::1');
+                    assert.strictEqual(result.servername, 'first.example.test');
+                    assert.deepStrictEqual(shared.dnsCache.get(HOST).value, { addresses: ['2001:db8::1'] });
+
+                    shared.resolveHostname({ host: HOST, servername: 'second.example.test' }, (err, result) => {
+                        assert.ok(!err);
+                        assert.strictEqual(result.cached, true);
+                        assert.strictEqual(result.servername, 'second.example.test');
+                        done();
+                    });
+                });
+            });
+
+            it('should hand back the server name of the caller from a stale cache entry', (t, done) => {
+                stubResolver(t, { 4: dnsError('ETIMEOUT'), 6: dnsError('ETIMEOUT') });
+                stubLookup(t, () => {
+                    done(new Error('lookup should not be called'));
+                });
+                setExpiredCache('192.0.2.4');
+
+                shared.resolveHostname({ host: HOST, servername: 'stale.example.test' }, (err, result) => {
+                    assert.ok(!err);
+                    assert.strictEqual(result.cached, true);
+                    assert.strictEqual(result.host, '192.0.2.4');
+                    assert.strictEqual(result.servername, 'stale.example.test');
+                    done();
+                });
+            });
+
+            it('should hand back the server name of the caller when lookup falls back to a stale cache entry', (t, done) => {
+                stubResolver(t, { 4: [], 6: [] });
+                stubLookup(t, (hostname, options, callback) => {
+                    callback(dnsError('ENOTFOUND'));
+                });
+                setExpiredCache('192.0.2.5');
+
+                shared.resolveHostname({ host: HOST, servername: 'lookup.example.test' }, (err, result) => {
+                    assert.ok(!err);
+                    assert.strictEqual(result.cached, true);
+                    assert.strictEqual(result.host, '192.0.2.5');
+                    assert.strictEqual(result.servername, 'lookup.example.test');
+
+                    shared.resolveHostname({ host: HOST }, (err, result) => {
+                        assert.ok(!err);
+                        assert.strictEqual(result.cached, true);
+                        assert.strictEqual(result.host, '192.0.2.5');
+                        assert.strictEqual(result.servername, HOST);
+                        done();
+                    });
+                });
+            });
+
+            it('should cache addresses only when falling back to lookup', (t, done) => {
+                stubResolver(t, { 4: [], 6: [] });
+                stubLookup(t, (hostname, options, callback) => {
+                    callback(null, [{ address: '192.0.2.6', family: 4 }]);
+                });
+
+                shared.resolveHostname({ host: HOST, servername: 'first.example.test' }, (err, result) => {
+                    assert.ok(!err);
+                    assert.deepStrictEqual(result, {
+                        servername: 'first.example.test',
+                        host: '192.0.2.6',
+                        cached: false
+                    });
+                    assert.deepStrictEqual(shared.dnsCache.get(HOST).value, { addresses: ['192.0.2.6'] });
+
+                    shared.resolveHostname({ host: HOST, servername: 'second.example.test' }, (err, result) => {
+                        assert.ok(!err);
+                        assert.deepStrictEqual(result, {
+                            servername: 'second.example.test',
+                            host: '192.0.2.6',
+                            cached: true
+                        });
+                        done();
+                    });
+                });
+            });
         });
     });
 });
