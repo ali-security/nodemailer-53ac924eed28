@@ -1609,4 +1609,153 @@ describe('MimeNode Tests', { timeout: 50 * 1000 }, () => {
             });
         });
     });
+    describe('recipient list scaling', () => {
+        const uniqueRecipients = count => {
+            const list = new Array(count);
+            for (let i = 0; i < count; i++) {
+                list[i] = 'u' + i + '@example.com';
+            }
+            return list;
+        };
+
+        // Recipients used to be deduped with uniqueList.filter(), a linear scan per address,
+        // so a list of distinct recipients cost O(n^2). 100k took ~35s. The budget sits far
+        // above the linear cost (~100ms) and far below the quadratic one.
+        it('should build an envelope for a large unique recipient list in linear time', () => {
+            const count = 100000;
+            const recipients = uniqueRecipients(count);
+
+            const started = Date.now();
+            const mb = new MimeNode('text/plain');
+            mb.setHeader('To', recipients.join(','));
+            const envelope = mb.getEnvelope();
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(envelope.to.length, count);
+            assert.ok(elapsed < 5000, `building ${count} recipients took ${elapsed}ms`);
+        });
+
+        // setEnvelope() runs the same dedupe for an explicitly provided envelope, spread
+        // over to, cc and bcc.
+        it('should set an envelope for a large unique recipient list in linear time', () => {
+            const count = 90000;
+            const recipients = uniqueRecipients(count);
+
+            const started = Date.now();
+            const mb = new MimeNode('text/plain');
+            mb.setEnvelope({
+                from: 'sender@example.com',
+                to: recipients.slice(0, count / 3).join(','),
+                cc: recipients.slice(count / 3, (count / 3) * 2).join(','),
+                bcc: recipients.slice((count / 3) * 2).join(',')
+            });
+            const envelope = mb.getEnvelope();
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(envelope.from, 'sender@example.com');
+            assert.strictEqual(envelope.to.length, count);
+            assert.ok(elapsed < 5000, `setting ${count} envelope recipients took ${elapsed}ms`);
+        });
+
+        // _parseAddresses flattened with concat.apply, which spreads every parsed entry
+        // into arguments and threw "Maximum call stack size exceeded" from about 124k
+        // recipients upwards. A large Bcc list reaches that on its own, no crafted input.
+        it('should accept a recipient array past the argument limit', () => {
+            const count = 200000;
+            const recipients = uniqueRecipients(count);
+            const mb = new MimeNode('text/plain');
+
+            assert.doesNotThrow(() => {
+                mb.setHeader('To', recipients);
+            });
+            assert.strictEqual(mb.getEnvelope().to.length, count);
+        });
+
+        // The dedupe set has to outlive one _convertAddresses call. Seeding it per call is
+        // O(headers x recipients), and header count is not bounded by three: `headers: { to:
+        // [...] }` emits one To header per entry, which made this shape slower than the
+        // linear-scan it replaced. 50k headers keep the linear cost (~250ms) far below the
+        // budget while the quadratic linear-scan dedupe takes several seconds.
+        it('should stay linear when recipients are spread over many headers', () => {
+            const count = 50000;
+
+            const started = Date.now();
+            const mb = new MimeNode('text/plain');
+            for (let i = 0; i < count; i++) {
+                mb.addHeader('To', 'u' + i + '@example.com');
+            }
+            const envelope = mb.getEnvelope();
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(envelope.to.length, count);
+            assert.ok(elapsed < 2000, `${count} single-recipient headers took ${elapsed}ms`);
+        });
+
+        // getAddresses() keeps one deduped list per header key, so it carries one set per key
+        // across all the headers that share it.
+        it('should stay linear in getAddresses when recipients are spread over many headers', () => {
+            const count = 50000;
+
+            const started = Date.now();
+            const mb = new MimeNode('text/plain');
+            for (let i = 0; i < count; i++) {
+                mb.addHeader('To', 'u' + i + '@example.com');
+            }
+            const addresses = mb.getAddresses();
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(addresses.to.length, count);
+            assert.ok(elapsed < 2000, `${count} single-recipient headers took ${elapsed}ms`);
+        });
+
+        it('should dedupe recipients across To, Cc and Bcc', () => {
+            const mb = new MimeNode('text/plain');
+            mb.setHeader('To', 'a@example.com, a@example.com, b@example.com');
+            mb.setHeader('Cc', 'b@example.com, c@example.com');
+            mb.setHeader('Bcc', 'a@example.com, d@example.com');
+
+            assert.deepStrictEqual(mb.getEnvelope().to, ['a@example.com', 'b@example.com', 'c@example.com', 'd@example.com']);
+        });
+
+        it('should dedupe set envelope recipients across to, cc and bcc', () => {
+            const mb = new MimeNode('text/plain');
+            mb.setEnvelope({
+                from: 'sender@example.com',
+                to: 'a@example.com, a@example.com, b@example.com',
+                cc: 'b@example.com, c@example.com',
+                bcc: 'a@example.com, d@example.com'
+            });
+
+            assert.deepStrictEqual(mb.getEnvelope().to, ['a@example.com', 'b@example.com', 'c@example.com', 'd@example.com']);
+        });
+
+        it('should dedupe getAddresses per header key across repeated headers', () => {
+            const mb = new MimeNode('text/plain');
+            mb.addHeader('To', 'a@example.com, a@example.com');
+            mb.addHeader('To', 'b@example.com, a@example.com');
+            mb.addHeader('Cc', 'a@example.com, b@example.com');
+
+            const addresses = mb.getAddresses();
+            assert.deepStrictEqual(addresses.to.map(a => a.address), ['a@example.com', 'b@example.com']);
+            assert.deepStrictEqual(addresses.cc.map(a => a.address), ['a@example.com', 'b@example.com']);
+        });
+
+        it('should dedupe a group against the addresses around it', () => {
+            const mb = new MimeNode('text/plain');
+            mb.setHeader('To', 'x@example.com, grp: x@example.com, y@example.com;, y@example.com');
+
+            assert.deepStrictEqual(mb.getEnvelope().to, ['x@example.com', 'y@example.com']);
+        });
+
+        it('should keep the rendered header list intact while deduping the envelope', () => {
+            const mb = new MimeNode('text/plain');
+            mb.setHeader('To', 'A <a@example.com>, a@example.com, b@example.com');
+
+            assert.strictEqual(mb.getHeader('To'), 'A <a@example.com>, a@example.com, b@example.com');
+            assert.deepStrictEqual(mb.getEnvelope().to, ['a@example.com', 'b@example.com']);
+
+            mb.setContent('hello');
+            assert.ok(mb.buildHeaders().split('\r\n').includes('To: A <a@example.com>, a@example.com, b@example.com'));
+        });
+    });
 });
