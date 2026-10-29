@@ -1584,7 +1584,150 @@ describe('SMTP-Connection Tests', () => {
             });
         });
     });
+
+    describe('Advertised AUTH mechanisms', () => {
+        it('reads every advertised SASL method in either AUTH spelling and in order of preference', (t, done) => {
+            startRawServer(
+                { EHLO: '250-test\r\n250-AUTH=login xoauth2\r\n250-AUTH\tCRAM-MD5  PLAIN\r\n250 AUTH X-PLAIN LOGINX\r\n' },
+                server => {
+                    const client = createClient(server);
+
+                    client.on('error', err => {
+                        finishRawServer(server, done, () => assert.fail('unexpected error: ' + err.message));
+                    });
+
+                    client.connect(() => {
+                        assert.strictEqual(client.allowsAuth, true);
+                        assert.deepStrictEqual(client._supportedAuth, ['PLAIN', 'LOGIN', 'CRAM-MD5', 'XOAUTH2']);
+                        client.quit();
+                    });
+
+                    client.on('end', () => finishRawServer(server, done));
+                }
+            );
+        });
+
+        it('does not take a method name that is only the start of another one', (t, done) => {
+            startRawServer({ EHLO: '250-test\r\n250 AUTH PLAINX X-LOGIN CRAM-MD5-PLUS\r\n' }, server => {
+                const client = createClient(server);
+
+                client.on('error', err => {
+                    finishRawServer(server, done, () => assert.fail('unexpected error: ' + err.message));
+                });
+
+                client.connect(() => {
+                    assert.strictEqual(client.allowsAuth, true);
+                    assert.deepStrictEqual(client._supportedAuth, []);
+                    client.quit();
+                });
+
+                client.on('end', () => finishRawServer(server, done));
+            });
+        });
+
+        // Each method used to be found with a pattern whose two whitespace runs overlapped, so
+        // an AUTH line padded with spaces and naming no known method backtracked quadratically
+        // and a hostile server stalled the event loop for tens of seconds from its EHLO reply
+        // (GHSA-4ffr-jq9g-5ffx). The budget is far above the linear cost and far below that one
+        it('reads an AUTH line padded with whitespace in linear time', (t, done) => {
+            const padding = ' '.repeat(200 * 1024);
+            startRawServer({ EHLO: '250-test\r\n250-AUTH' + padding + 'NOMATCH\r\n250 AUTH=' + padding + 'LOGIN\r\n' }, server => {
+                const client = createClient(server);
+
+                client.on('error', err => {
+                    finishRawServer(server, done, () => assert.fail('unexpected error: ' + err.message));
+                });
+
+                const started = Date.now();
+                client.connect(() => {
+                    const elapsed = Date.now() - started;
+                    assert.deepStrictEqual(client._supportedAuth, ['LOGIN']);
+                    assert.ok(elapsed < 2000, `reading the EHLO reply took ${elapsed}ms`);
+                    client.quit();
+                });
+
+                client.on('end', () => finishRawServer(server, done));
+            });
+        });
+    });
 });
+
+/**
+ * Starts a minimal scripted SMTP server on an ephemeral localhost port, so a test controls
+ * the exact bytes of every reply. Replies are keyed by command verb, anything not listed
+ * is answered with a plain 250 and QUIT always ends the session.
+ */
+function startRawServer(script, callback) {
+    const sockets = new Set();
+    const server = net.createServer(socket => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        socket.on('error', () => false);
+
+        let buffer = '';
+        socket.write(script.greeting || '220 test ESMTP\r\n');
+        socket.on('data', chunk => {
+            buffer += chunk.toString('binary');
+            let idx;
+            while ((idx = buffer.indexOf('\r\n')) !== -1) {
+                const line = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                const verb = line.split(' ')[0].toUpperCase();
+                if (verb === 'QUIT') {
+                    socket.end('221 Bye\r\n');
+                } else if (Object.prototype.hasOwnProperty.call(script, verb)) {
+                    socket.write(script[verb]);
+                } else {
+                    socket.write('250 OK\r\n');
+                }
+            }
+        });
+    });
+    server.rawSockets = sockets;
+    server.listen(0, '127.0.0.1', () => callback(server));
+}
+
+/**
+ * Tears the scripted server down and reports to the test runner exactly once. Assertions
+ * run inside a try/catch so a failure reaches `done` instead of escaping as an uncaught
+ * exception.
+ */
+function finishRawServer(server, done, assertions) {
+    if (server.rawFinished) {
+        return;
+    }
+    server.rawFinished = true;
+    for (const socket of server.rawSockets) {
+        socket.destroy();
+    }
+    server.close(() => {
+        try {
+            if (assertions) {
+                assertions();
+            }
+        } catch (err) {
+            return done(err);
+        }
+        done();
+    });
+}
+
+/**
+ * Builds a client pointed at the scripted server, in plaintext and without logging.
+ */
+function createClient(server, options) {
+    return new SMTPConnection(
+        Object.assign(
+            {
+                port: server.address().port,
+                host: '127.0.0.1',
+                ignoreTLS: true,
+                logger: false
+            },
+            options
+        )
+    );
+}
 
 function proxyConnect(port, host, destinationPort, destinationHost, callback) {
     let socket = net.connect(port, host, () => {
