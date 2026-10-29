@@ -252,6 +252,38 @@ describe('Shared Funcs Tests', { timeout: 100 * 1000 }, () => {
             });
         });
 
+        it('should reject file access when disableFileAccess option is set', (t, done) => {
+            let mail = {
+                data: {
+                    html: {
+                        path: __dirname + '/fixtures/message.html'
+                    }
+                }
+            };
+            shared.resolveContent(mail.data, 'html', { disableFileAccess: true }, (err, value) => {
+                assert.ok(err);
+                assert.strictEqual(err.code, 'EFILEACCESS');
+                assert.ok(!value);
+                done();
+            });
+        });
+
+        it('should reject url access when disableUrlAccess option is set', (t, done) => {
+            let mail = {
+                data: {
+                    html: {
+                        path: 'http://localhost:' + port + '/message.html'
+                    }
+                }
+            };
+            shared.resolveContent(mail.data, 'html', { disableUrlAccess: true }, (err, value) => {
+                assert.ok(err);
+                assert.strictEqual(err.code, 'EURLACCESS');
+                assert.ok(!value);
+                done();
+            });
+        });
+
         describe('data uri tests', () => {
             it('should resolve with mime type and base64', (t, done) => {
                 let mail = {
