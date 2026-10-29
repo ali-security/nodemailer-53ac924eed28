@@ -97,6 +97,150 @@ describe('SMTP-Connection Tests', () => {
         });
     });
 
+    describe('Multiline response reassembly', () => {
+        // A connection that is never wired to a socket, with an action queue that keeps
+        // collecting whatever completed replies the parser hands over
+        function feedingConnection(options) {
+            const conn = new SMTPConnection(Object.assign({ logger: false }, options));
+            const received = [];
+            const errors = [];
+            conn.on('error', err => errors.push(err));
+            const collect = str => {
+                received.push(str);
+                conn._responseActions.push(collect);
+            };
+            conn._responseActions = [collect];
+            return { conn, received, errors };
+        }
+
+        it('joins the continuation lines of a reply split across chunks', () => {
+            const { conn, received, errors } = feedingConnection();
+            // one byte at a time, so the partial state has to survive every _onData call
+            for (const chr of '250-first\r\n250-second\r\n250 third\r\n') {
+                conn._onData(Buffer.from(chr, 'binary'));
+            }
+            conn.close();
+            assert.deepStrictEqual(errors, []);
+            assert.deepStrictEqual(received, ['250-first\n250-second\n250 third']);
+        });
+
+        it('keeps consecutive replies in one chunk apart', async () => {
+            const { conn, received, errors } = feedingConnection();
+            conn._onData(Buffer.from('220 greeting\r\n250-first\r\n250 second\r\n250 third\r\n', 'binary'));
+            // the queue is drained one reply per tick
+            await new Promise(resolve => setTimeout(resolve, 50));
+            conn.close();
+            assert.deepStrictEqual(errors, []);
+            assert.deepStrictEqual(received, ['220 greeting', '250-first\n250 second', '250 third']);
+        });
+
+        // Every continuation line was appended to the queue entry and the entry was then
+        // re-scanned to find its last line, which re-flattens a string that grows with the
+        // reply. A hostile peer streaming continuation lines drove the reassembly quadratic
+        // before the client ever authenticated: 128k lines took ~15s of blocked event loop
+        // (GHSA-4g23-2xm8-66gc). The budget is far above the linear cost (~10ms) and far
+        // below the quadratic one, so it only trips if the reassembly regresses.
+        it('reassembles a very long reply in linear time', () => {
+            const count = 128000;
+            // the cap is raised so this measures the reassembly and not the size guard
+            const { conn, received, errors } = feedingConnection({ maxResponseSize: 100 * 1024 * 1024 });
+
+            let payload = '';
+            for (let i = 0; i < count; i++) {
+                payload += '250-capability line ' + i + '\r\n';
+            }
+            payload += '250 DONE\r\n';
+
+            const started = Date.now();
+            conn._onData(Buffer.from(payload, 'binary'));
+            const elapsed = Date.now() - started;
+            conn.close();
+
+            assert.deepStrictEqual(errors, []);
+            assert.strictEqual(received.length, 1);
+            assert.strictEqual(received[0].split('\n').length, count + 1);
+            assert.ok(elapsed < 5000, `reassembling ${count} continuation lines took ${elapsed}ms`);
+        });
+
+        it('fails the connection when a reply never completes', () => {
+            const { conn, received, errors } = feedingConnection({ maxResponseSize: 16 * 1024 });
+            // a peer that keeps the reply open forever would otherwise buffer without bound
+            for (let i = 0; i < 40; i++) {
+                conn._onData(Buffer.from('220-flood line padded out to a few hundred bytes '.repeat(10) + '\r\n', 'binary'));
+            }
+            assert.deepStrictEqual(received, []);
+            assert.strictEqual(errors.length, 1);
+            assert.strictEqual(errors[0].code, 'EPROTOCOL');
+            assert.match(errors[0].message, /exceeds maximum allowed size/);
+        });
+
+        it('fails the connection when a single line never ends', () => {
+            const { conn, errors } = feedingConnection({ maxResponseSize: 16 * 1024 });
+            // no line break at all, so the bytes pile up in the remainder instead
+            for (let i = 0; i < 40; i++) {
+                conn._onData(Buffer.from('x'.repeat(1024), 'binary'));
+            }
+            assert.strictEqual(errors.length, 1);
+            assert.strictEqual(errors[0].code, 'EPROTOCOL');
+        });
+
+        // The cap bounds one reply, so a connection that keeps receiving replies just under
+        // it must stay up however many of them arrive
+        it('does not accumulate separate replies towards the cap', async () => {
+            const { conn, received, errors } = feedingConnection({ maxResponseSize: 16 * 1024 });
+            const reply = '250-capability line padded out to some length\r\n'.repeat(300) + '250 DONE\r\n';
+            assert.ok(reply.length > 8 * 1024 && reply.length < 16 * 1024, 'the reply has to sit just under the cap');
+            for (let i = 0; i < 5; i++) {
+                conn._onData(Buffer.from(reply, 'binary'));
+            }
+            await new Promise(resolve => setTimeout(resolve, 50));
+            conn.close();
+            assert.deepStrictEqual(errors, []);
+            assert.strictEqual(received.length, 5);
+        });
+
+        // The guard used to be applied once per chunk and after the completed reply had
+        // already been forgotten, so whether an oversized reply was caught depended on how
+        // the peer happened to split it into TCP segments
+        it('applies the cap the same way however the reply is split', () => {
+            const oversized = '250-capability line padded out to some length\r\n'.repeat(600) + '250 DONE\r\n';
+            assert.ok(oversized.length > 16 * 1024, 'the reply has to exceed the cap');
+
+            const whole = feedingConnection({ maxResponseSize: 16 * 1024 });
+            whole.conn._onData(Buffer.from(oversized, 'binary'));
+
+            const split = feedingConnection({ maxResponseSize: 16 * 1024 });
+            for (let pos = 0; pos < oversized.length; pos += 500) {
+                split.conn._onData(Buffer.from(oversized.slice(pos, pos + 500), 'binary'));
+            }
+
+            for (const { received, errors } of [whole, split]) {
+                assert.deepStrictEqual(received, []);
+                assert.strictEqual(errors.length, 1);
+                assert.strictEqual(errors[0].code, 'EPROTOCOL');
+            }
+        });
+
+        // The remainder holds the line currently being received, and it used to be re-split
+        // together with every new chunk, rescanning everything buffered so far. A peer that
+        // drip-fed a line that never ends made that quadratic even with the cap in place:
+        // 1 MB in one byte chunks took ~60s of blocked event loop.
+        it('absorbs a line that never ends in linear time', () => {
+            const { conn, errors } = feedingConnection({ maxResponseSize: 1024 * 1024 });
+
+            const started = Date.now();
+            // one byte at a time, the worst case for re-splitting the remainder
+            for (let i = 0; i < 1024 * 1024 + 16; i++) {
+                conn._onData(Buffer.from('x', 'binary'));
+            }
+            const elapsed = Date.now() - started;
+
+            assert.strictEqual(errors.length, 1);
+            assert.strictEqual(errors[0].code, 'EPROTOCOL');
+            assert.ok(elapsed < 5000, `absorbing 1MB one byte at a time took ${elapsed}ms`);
+        });
+    });
+
     describe('Connection tests', () => {
         let server, insecureServer, invalidServer, secureServer, disconnectingServer, httpProxy;
 
